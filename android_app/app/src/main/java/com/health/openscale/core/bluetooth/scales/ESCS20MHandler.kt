@@ -67,9 +67,8 @@ class ESCS20mHandler : ScaleDeviceHandler() {
     private val CHR_RESULTS   = uuid16(0x2A10) // notifications with results
 
     // "Magic" commands from the legacy driver
-    private val MAGIC_START_MEAS = byteArrayOf(
-        0x55, 0xAA.toByte(), 0x90.toByte(), 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x94.toByte()
-    )
+    // NOTE: MAGIC_START_MEAS is now built dynamically in buildStartCommand() to include user
+    // profile (sex/height/age). The scale requires this to enable impedance measurement.
     private val MAGIC_DELETE_HISTORY = byteArrayOf(
         0x55, 0xAA.toByte(), 0x95.toByte(), 0x00, 0x01, 0x01, 0x96.toByte()
     )
@@ -111,8 +110,12 @@ class ESCS20mHandler : ScaleDeviceHandler() {
         // Subscribe to results characteristic only (CHR_CUR_TIME/0x2A11 is WRITE-only, no NOTIFY support)
         setNotifyOn(SVC_MAIN, CHR_RESULTS)
 
-        // Kick off a session
-        writeTo(SVC_MAIN, CHR_CUR_TIME, MAGIC_START_MEAS)
+        // Kick off a session. Include user profile in start command so the scale enables
+        // impedance measurement (without it the scale sends weight-only 0x14 frames).
+        val startCmd = buildStartCommand(user)
+        LogManager.d(TAG, "Sending start cmd: sex=${if (user.gender.isMale()) "M" else "F"}" +
+                ", height=${user.bodyHeight.toInt()}cm, age=${user.age}")
+        writeTo(SVC_MAIN, CHR_CUR_TIME, startCmd)
         writeTo(SVC_MAIN, CHR_CUR_TIME, MAGIC_DELETE_HISTORY)
 
         LogManager.i(TAG, "Session started; waiting for frames…")
@@ -259,7 +262,10 @@ class ESCS20mHandler : ScaleDeviceHandler() {
 
         if (hasEmbedded && !hasSeparateExt) {
             val resistance = u16be(msg, 10)
+            LogManager.d(TAG, "Embedded resistance in 0x14 frame: $resistance Ω")
             applyExtended(resistance, calc, user)
+        } else if (!hasEmbedded) {
+            LogManager.d(TAG, "No resistance in 0x14 frame (bytes[10:11]=0x0000); weight-only frame")
         }
     }
 
@@ -301,6 +307,43 @@ class ESCS20mHandler : ScaleDeviceHandler() {
     // -------------------------------------------------------------------------
     // Small helpers
     // -------------------------------------------------------------------------
+
+    /**
+     * Build the 0x90 "start measurement" command with the user's body profile.
+     *
+     * Protocol: 55 AA 90 00 04 [mode] [sex] [height_cm] [age] [checksum]
+     *   mode = 0x01  (body-composition session; 0x00 would be weight-only)
+     *   sex  = 0x01 male / 0x00 female
+     *   height = cm, single byte
+     *   age    = years, single byte
+     *
+     * Sending zeros for sex/height/age causes the scale to revert to weight-only
+     * mode and omit resistance data from 0x14 frames (impedance stays 0x0000).
+     */
+    private fun buildStartCommand(user: ScaleUser): ByteArray {
+        val sex:    Byte = if (user.gender.isMale()) 0x01 else 0x00
+        val height: Byte = user.bodyHeight.toInt().coerceIn(0, 255).toByte()
+        val age:    Byte = user.age.coerceIn(0, 255).toByte()
+        return buildFrame(0x90.toByte(), byteArrayOf(0x01, sex, height, age))
+    }
+
+    /**
+     * Assemble a Lefu/Renpho frame:  55 AA [cmd] 00 [len] [payload…] [sum-checksum]
+     * Checksum = sum of every byte preceding it, truncated to 8 bits.
+     */
+    private fun buildFrame(cmd: Byte, payload: ByteArray): ByteArray {
+        val buf = ByteArray(5 + payload.size + 1)
+        buf[0] = 0x55
+        buf[1] = 0xAA.toByte()
+        buf[2] = cmd
+        buf[3] = 0x00
+        buf[4] = payload.size.toByte()
+        payload.copyInto(buf, 5)
+        var sum = 0
+        for (i in 0 until buf.size - 1) sum += buf[i].toInt() and 0xFF
+        buf[buf.size - 1] = (sum and 0xFF).toByte()
+        return buf
+    }
 
     private fun u16be(b: ByteArray, off: Int): Int {
         if (off + 1 >= b.size) return 0
