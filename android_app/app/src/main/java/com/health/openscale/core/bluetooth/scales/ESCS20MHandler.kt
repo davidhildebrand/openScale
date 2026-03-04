@@ -79,8 +79,9 @@ class ESCS20mHandler : ScaleDeviceHandler() {
 
     // ── QN-style / 0xFFF0 service ────────────────────────────────────────────
     private val SVC_FFF0 = uuid16(0xFFF0)
-    private val CHR_FFF1 = uuid16(0xFFF1) // QN notify: 0x12 scale-info, 0x10 weight+resistance
-    private val CHR_FFF2 = uuid16(0xFFF2) // QN write:  0x13 unit-cfg, 0x02 time-sync
+    private val CHR_FFF1 = uuid16(0xFFF1) // READ|WRITE|NOTIFY – primary QN channel
+    private val CHR_FFF2 = uuid16(0xFFF2) // READ|WRITE|WRITE_NR|NOTIFY – command + possible notify
+    private val CHR_FFF3 = uuid16(0xFFF3) // NOTIFY only – possible secondary output channel
 
     // "Magic" commands for the 0x1A10 service.
     // NOTE: the 0x90 payload MUST remain [01 00 00 00]; the scale rejects any other payload.
@@ -127,14 +128,20 @@ class ESCS20mHandler : ScaleDeviceHandler() {
         rawFrames.clear()
         resetAccumulator()
 
-        // Subscribe to the Lefu weight service
-        setNotifyOn(SVC_MAIN, CHR_RESULTS)
-
-        // Subscribe to the QN body-composition service (impedance arrives here)
+        // Step 1: Subscribe to ALL three QN channels before doing anything else, so the
+        // body-composition channel is live when the scale starts its measurement session.
         setNotifyOn(SVC_FFF0, CHR_FFF1)
+        setNotifyOn(SVC_FFF0, CHR_FFF2)
+        setNotifyOn(SVC_FFF0, CHR_FFF3)
 
-        // Kick off a weight-measurement session on the Lefu service.
-        // The 0x90 payload [01 00 00 00] must stay as-is; the scale rejects other payloads.
+        // Step 2: Proactively send QN unit-config + time-sync to 0xFFF2 without waiting for
+        // the 0x12 scale-info frame (the scale may not send it spontaneously).
+        // qnProtocolType defaults to 0x00 here; it will be updated if 0x12 arrives later.
+        sendQnConfig(user)
+
+        // Step 3: Subscribe to Lefu weight service and kick off measurement.
+        // The 0x90 payload [01 00 00 00] must stay as-is; the scale rejects any other payload.
+        setNotifyOn(SVC_MAIN, CHR_RESULTS)
         writeTo(SVC_MAIN, CHR_CUR_TIME, MAGIC_START_MEAS)
         writeTo(SVC_MAIN, CHR_CUR_TIME, MAGIC_DELETE_HISTORY)
 
@@ -145,7 +152,9 @@ class ESCS20mHandler : ScaleDeviceHandler() {
 
     override fun onNotification(characteristic: UUID, data: ByteArray, user: ScaleUser) {
         when (characteristic) {
-            CHR_FFF1 -> handleQnFrame(data, user)
+            CHR_FFF1 -> handleQnFrame(data, user, "0xFFF1")
+            CHR_FFF2 -> handleQnFrame(data, user, "0xFFF2")
+            CHR_FFF3 -> handleQnFrame(data, user, "0xFFF3")
             CHR_RESULTS, CHR_CUR_TIME -> handleLefuFrame(data, user)
             else -> LogManager.d(TAG, "Notify from unrelated chr=$characteristic len=${data.size}")
         }
@@ -159,11 +168,11 @@ class ESCS20mHandler : ScaleDeviceHandler() {
      * 0x12 scale-info  → capture protocol type, send 0x13 unit-cfg + 0x02 time-sync to 0xFFF2.
      * 0x10 live frame  → when stable flag set, extract resistance for body-composition calc.
      */
-    private fun handleQnFrame(data: ByteArray, user: ScaleUser) {
+    private fun handleQnFrame(data: ByteArray, user: ScaleUser, chrLabel: String = "0xFFF1") {
         if (data.isEmpty()) return
 
         val hex = data.joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
-        LogManager.d(TAG, "QN 0xFFF1 len=${data.size}: [$hex]")
+        LogManager.d(TAG, "QN $chrLabel len=${data.size}: [$hex]")
 
         when (data[0].toInt() and 0xFF) {
             0x12 -> {
