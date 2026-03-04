@@ -27,31 +27,39 @@ import java.util.Locale
 import java.util.UUID
 
 /**
- * Handler for ES-CS20M scales (Yunmai lineage).
+ * Handler for ES-CS20M scales (Yunmai / Lefu lineage).
  *
- * Supported measurements:
- *  - Weight (from 0x14 frames)
- *  - Body composition via impedance/resistance (from 0x14 embedded or 0x15 frames):
- *    fat%, muscle%, water%, bone mass, lean body mass, visceral fat
- *    (computed using YunmaiLib with user profile data)
+ * The scale exposes TWO vendor services:
  *
- * Device uses a vendor service (0x1A10) and two characteristics:
- *  - 0x2A11: bidirectional control (also used to send "start measurement" & "delete history" magic)
- *  - 0x2A10: notifications with result frames
+ *  1. 0x1A10 (Lefu/Renpho weight service)
+ *       0x2A11 WRITE – "start measurement" and "delete history" commands
+ *       0x2A10 NOTIFY – weight frames (0x11 start/stop, 0x14 weight)
+ *     → Delivers weight only; impedance bytes are always 0x0000 in 0x14 frames.
  *
- * The device streams multiple frames during a session. We buffer all frames and
- * only parse/publish when a STOP message arrives, mirroring the legacy behaviour:
- *  - Message IDs:
- *      0x11 -> start/stop response (contains measurement-type)
- *      0x14 -> weight response (may embed resistance if present)
- *      0x15 -> extended response (resistance)
+ *  2. 0xFFF0 (QN-style body-composition service)
+ *       0xFFF1 NOTIFY – QN protocol frames (0x12 scale info, 0x10 weight + resistance)
+ *       0xFFF2 WRITE  – QN protocol commands (0x13 unit config, 0x02 time sync)
+ *     → Delivers weight + resistance (impedance) for body-composition calculation.
+ *
+ * Protocol flow:
+ *   onConnected → setNotifyOn(0x2A10) + setNotifyOn(0xFFF1)
+ *               → write 0x90 start to 0x2A11
+ *               → write 0x95 delete-history to 0x2A11
+ *   scale → 0x11 START (0x2A10)
+ *   scale → 0x12 scale-info (0xFFF1) → app replies: 0x13 unit-cfg + 0x02 time-sync to 0xFFF2
+ *   scale → 0x14 weight frames (0x2A10, many)
+ *   scale → 0x10 stable weight+resistance (0xFFF1)  ← impedance arrives here
+ *   scale → 0x11 STOP (0x2A10)  → parseAllFramesAndPublish()
+ *
+ * Body composition (fat%, water%, muscle%, bone, LBM, visceral fat) is computed
+ * via YunmaiLib using the resistance value received on 0xFFF1.
  */
 class ESCS20mHandler : ScaleDeviceHandler() {
 
     companion object {
         private const val TAG = "ESCS20mHandler"
 
-        // Message IDs (byte[2] in frames)
+        // Message IDs (byte[2] in 0x1A10 / Lefu frames)
         private const val MSG_START_STOP_RESP: Int = 0x11
         private const val MSG_WEIGHT_RESP:     Int = 0x14
         private const val MSG_EXTENDED_RESP:   Int = 0x15
@@ -59,27 +67,41 @@ class ESCS20mHandler : ScaleDeviceHandler() {
         // START/STOP indicator position in MSG_START_STOP_RESP frames
         // byte[5] = 0x01 -> START, byte[5] = 0x00 -> STOP
         private const val START_STOP_FLAG_INDEX: Int = 5
+
+        // QN epoch offset: seconds between Unix epoch (1970) and QN epoch (2000-01-01 UTC)
+        private const val QN_EPOCH_OFFSET_SEC = 946_702_800L
     }
 
-    // Vendor service / characteristics (16-bit base UUIDs)
+    // ── Lefu / 0x1A10 service ────────────────────────────────────────────────
     private val SVC_MAIN      = uuid16(0x1A10)
-    private val CHR_CUR_TIME  = uuid16(0x2A11) // control / command mailbox
+    private val CHR_CUR_TIME  = uuid16(0x2A11) // control / command mailbox (WRITE only)
     private val CHR_RESULTS   = uuid16(0x2A10) // notifications with results
 
-    // "Magic" commands from the legacy driver
-    // NOTE: MAGIC_START_MEAS is now built dynamically in buildStartCommand() to include user
-    // profile (sex/height/age). The scale requires this to enable impedance measurement.
+    // ── QN-style / 0xFFF0 service ────────────────────────────────────────────
+    private val SVC_FFF0 = uuid16(0xFFF0)
+    private val CHR_FFF1 = uuid16(0xFFF1) // QN notify: 0x12 scale-info, 0x10 weight+resistance
+    private val CHR_FFF2 = uuid16(0xFFF2) // QN write:  0x13 unit-cfg, 0x02 time-sync
+
+    // "Magic" commands for the 0x1A10 service.
+    // NOTE: the 0x90 payload MUST remain [01 00 00 00]; the scale rejects any other payload.
+    // User profile (sex/height/age) is communicated via the QN 0x13 command on 0xFFF2 instead.
+    private val MAGIC_START_MEAS = byteArrayOf(
+        0x55, 0xAA.toByte(), 0x90.toByte(), 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x94.toByte()
+    )
     private val MAGIC_DELETE_HISTORY = byteArrayOf(
         0x55, 0xAA.toByte(), 0x95.toByte(), 0x00, 0x01, 0x01, 0x96.toByte()
     )
 
-    // Session buffer and accumulator (mirrors legacy approach)
-    private val rawFrames = mutableListOf<ByteArray>()
+    // ── Session state ────────────────────────────────────────────────────────
+    private val rawFrames = mutableListOf<ByteArray>()  // 0x1A10 frame buffer
     private val acc = ScaleMeasurement()
 
-    /**
-     * Identify the device by advertised service 0x1A10 (and optionally by name).
-     */
+    // QN-protocol state
+    private var qnProtocolType: Byte = 0x00  // captured from 0x12 frame; echoed in 0x13 reply
+    private var qnResistance: Int = 0        // resistance (Ω) received on 0xFFF1 0x10 frame
+
+    // ── Device identification ────────────────────────────────────────────────
+
     override fun supportFor(device: ScannedDeviceInfo): DeviceSupport? {
         val name = device.name.lowercase(Locale.ROOT)
         val hasSvc = device.serviceUuids.any { it == SVC_MAIN }
@@ -88,8 +110,8 @@ class ESCS20mHandler : ScaleDeviceHandler() {
         if (!looksEscs20m) return null
 
         val caps = setOf(
-            DeviceCapability.BODY_COMPOSITION,   // we compute composition from resistance
-            DeviceCapability.LIVE_WEIGHT_STREAM  // device streams multiple frames during session
+            DeviceCapability.BODY_COMPOSITION,
+            DeviceCapability.LIVE_WEIGHT_STREAM
         )
         return DeviceSupport(
             displayName = "ES-CS20M",
@@ -99,65 +121,134 @@ class ESCS20mHandler : ScaleDeviceHandler() {
         )
     }
 
-    /**
-     * Enable notifications and send the vendor commands to start measuring
-     * and clear history (like the legacy Java flow).
-     */
+    // ── Connection sequencing ────────────────────────────────────────────────
+
     override fun onConnected(user: ScaleUser) {
         rawFrames.clear()
         resetAccumulator()
 
-        // Subscribe to results characteristic only (CHR_CUR_TIME/0x2A11 is WRITE-only, no NOTIFY support)
+        // Subscribe to the Lefu weight service
         setNotifyOn(SVC_MAIN, CHR_RESULTS)
 
-        // Kick off a session. Include user profile in start command so the scale enables
-        // impedance measurement (without it the scale sends weight-only 0x14 frames).
-        val startCmd = buildStartCommand(user)
-        LogManager.d(TAG, "Sending start cmd: sex=${if (user.gender.isMale()) "M" else "F"}" +
-                ", height=${user.bodyHeight.toInt()}cm, age=${user.age}")
-        writeTo(SVC_MAIN, CHR_CUR_TIME, startCmd)
+        // Subscribe to the QN body-composition service (impedance arrives here)
+        setNotifyOn(SVC_FFF0, CHR_FFF1)
+
+        // Kick off a weight-measurement session on the Lefu service.
+        // The 0x90 payload [01 00 00 00] must stay as-is; the scale rejects other payloads.
+        writeTo(SVC_MAIN, CHR_CUR_TIME, MAGIC_START_MEAS)
         writeTo(SVC_MAIN, CHR_CUR_TIME, MAGIC_DELETE_HISTORY)
 
         LogManager.i(TAG, "Session started; waiting for frames…")
     }
 
+    // ── Notification handling ────────────────────────────────────────────────
+
+    override fun onNotification(characteristic: UUID, data: ByteArray, user: ScaleUser) {
+        when (characteristic) {
+            CHR_FFF1 -> handleQnFrame(data, user)
+            CHR_RESULTS, CHR_CUR_TIME -> handleLefuFrame(data, user)
+            else -> LogManager.d(TAG, "Notify from unrelated chr=$characteristic len=${data.size}")
+        }
+    }
+
+    // ── 0xFFF1 / QN-protocol frame handler ───────────────────────────────────
+
     /**
-     * Buffer all frames; only when we see a START/STOP response do we act.
-     * We then parse and publish when STOP is detected.
+     * Handle frames arriving on 0xFFF1 (QN-style body-composition service).
+     *
+     * 0x12 scale-info  → capture protocol type, send 0x13 unit-cfg + 0x02 time-sync to 0xFFF2.
+     * 0x10 live frame  → when stable flag set, extract resistance for body-composition calc.
+     */
+    private fun handleQnFrame(data: ByteArray, user: ScaleUser) {
+        if (data.isEmpty()) return
+
+        val hex = data.joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
+        LogManager.d(TAG, "QN 0xFFF1 len=${data.size}: [$hex]")
+
+        when (data[0].toInt() and 0xFF) {
+            0x12 -> {
+                // Scale-info frame: capture protocol type, then send QN configuration
+                qnProtocolType = if (data.size > 2) data[2] else 0x00
+                LogManager.d(TAG, "QN 0x12 scale-info: protocol=0x%02X".format(qnProtocolType.toInt() and 0xFF))
+                sendQnConfig(user)
+            }
+            0x10 -> {
+                // Live weight + resistance frame.
+                // Original QN format: [opcode][len?][proto][weight_hi][weight_lo][stable][r1_hi][r1_lo][r2_hi][r2_lo]
+                if (data.size < 10) {
+                    LogManager.d(TAG, "QN 0x10 frame too short (${data.size} bytes)")
+                    return
+                }
+                val stable = data[5].toInt() == 1
+                if (!stable) {
+                    LogManager.d(TAG, "QN 0x10 unstable weight frame; skipping")
+                    return
+                }
+                val resistance = ((data[6].toInt() and 0xFF) shl 8) or (data[7].toInt() and 0xFF)
+                LogManager.d(TAG, "QN 0x10 stable: resistance=$resistance Ω (bytes[6:7])")
+                if (resistance > 0) {
+                    qnResistance = resistance
+                }
+            }
+            else -> LogManager.d(TAG, "QN unhandled opcode=0x%02X".format(data[0].toInt() and 0xFF))
+        }
+    }
+
+    /**
+     * Send the QN unit-configuration and time-sync commands to 0xFFF2.
+     * Must be called after receiving the 0x12 scale-info frame so [qnProtocolType] is known.
+     */
+    private fun sendQnConfig(user: ScaleUser) {
+        val unitByte: Byte = 0x01 // kg (0x02 = lb)
+
+        // 0x13 unit-configuration frame
+        val cfg = byteArrayOf(0x13, 0x09, qnProtocolType, unitByte, 0x10, 0x00, 0x00, 0x00, 0x00)
+        cfg[cfg.lastIndex] = qnChecksum(cfg)
+        writeTo(SVC_FFF0, CHR_FFF2, cfg, withResponse = false)
+
+        // 0x02 time-sync frame (seconds since QN epoch 2000-01-01, little-endian)
+        val epochSecs = ((System.currentTimeMillis() / 1000L) - QN_EPOCH_OFFSET_SEC).toInt()
+        val timeSync = byteArrayOf(
+            0x02,
+            (epochSecs and 0xFF).toByte(),
+            ((epochSecs ushr 8)  and 0xFF).toByte(),
+            ((epochSecs ushr 16) and 0xFF).toByte(),
+            ((epochSecs ushr 24) and 0xFF).toByte()
+        )
+        writeTo(SVC_FFF0, CHR_FFF2, timeSync, withResponse = false)
+
+        LogManager.d(TAG, "QN config sent: unit=kg, time-sync epochSecs=$epochSecs")
+    }
+
+    /** Sum-of-bytes checksum used by the QN protocol (excludes the last byte). */
+    private fun qnChecksum(buf: ByteArray): Byte {
+        var s = 0
+        for (i in 0 until buf.size - 1) s = (s + (buf[i].toInt() and 0xFF)) and 0xFF
+        return s.toByte()
+    }
+
+    // ── 0x2A10 / Lefu-protocol frame handler ─────────────────────────────────
+
+    /**
+     * Buffer all Lefu frames; take action only on 0x11 START/STOP frames.
      *
      * Protocol (from captured traffic):
-     *   START frame: 55 AA 11 00 0A 01 01 01 00 00 3D 00 00 00 00 5A  (byte[5] = 0x01)
-     *   STOP frame:  55 AA 11 00 0A 00 01 01 00 00 3D 00 00 00 00 59  (byte[5] = 0x00)
+     *   START frame: 55 AA 11 00 0A 01 01 01 00 00 39 00 00 00 00 56  (byte[5] = 0x01)
+     *   STOP  frame: 55 AA 11 00 0A 00 01 01 00 00 39 00 00 00 00 55  (byte[5] = 0x00)
      */
-    override fun onNotification(characteristic: UUID, data: ByteArray, user: ScaleUser) {
-        if (characteristic != CHR_RESULTS && characteristic != CHR_CUR_TIME) {
-            LogManager.d(TAG, "Notify from unrelated chr=$characteristic len=${data.size}")
-            return
-        }
-
-        // Buffer every frame
+    private fun handleLefuFrame(data: ByteArray, user: ScaleUser) {
         rawFrames += data.copyOf()
 
-        // Guard: need at least 3 bytes for msgId at [2]
         if (data.size < 3) return
         val msgId = data[2].toInt() and 0xFF
-
-        // We only take action on 0x11 frames (start/stop) to keep legacy sequencing
         if (msgId != MSG_START_STOP_RESP) return
 
-        // Guard: need at least 6 bytes for start/stop flag at [5]
         if (data.size < 6) return
         val startStopFlag = data[START_STOP_FLAG_INDEX].toInt() and 0xFF
 
-        // START/STOP is indicated by byte[5]: 0x01 = START, 0x00 = STOP
-        val isStart = startStopFlag != 0
-        val isStop = startStopFlag == 0
-
         when {
-            isStart -> {
-                LogManager.d(TAG, "Measurement started (flag=$startStopFlag)")
-            }
-            isStop -> {
+            startStopFlag != 0 -> LogManager.d(TAG, "Measurement started (flag=$startStopFlag)")
+            else -> {
                 LogManager.d(TAG, "Measurement stopped (flag=$startStopFlag) → parse & publish")
                 parseAllFramesAndPublish(user)
             }
@@ -165,14 +256,11 @@ class ESCS20mHandler : ScaleDeviceHandler() {
     }
 
     override fun onDisconnected() {
-        // No queued publish on disconnect for this device; we only publish once on STOP.
         rawFrames.clear()
         resetAccumulator()
     }
 
-    // -------------------------------------------------------------------------
-    // Parsing (mirrors legacy Java: parse on STOP, iterate buffered frames)
-    // -------------------------------------------------------------------------
+    // ── Parsing and publishing ────────────────────────────────────────────────
 
     private fun parseAllFramesAndPublish(user: ScaleUser) {
         if (rawFrames.isEmpty()) {
@@ -180,20 +268,23 @@ class ESCS20mHandler : ScaleDeviceHandler() {
             return
         }
 
-        // Create Yunmai calculator with user info
         val sex = if (user.gender.isMale()) 1 else 0
         val yunmai = YunmaiLib(sex, user.bodyHeight, user.activityLevel)
 
-        // Sort frames by msgId (legacy sorted by msg[2]); keeps behaviour consistent
+        // Sort frames by msgId (legacy behaviour)
         val frames = rawFrames.sortedBy { (it.getOrNull(2)?.toInt() ?: 0) and 0xFF }
-
         val weightFrameCount = frames.count { it.size >= 3 && (it[2].toInt() and 0xFF) == MSG_WEIGHT_RESP }
         LogManager.d(TAG, "Parsing ${frames.size} frames ($weightFrameCount weight frames)…")
 
-        // Run through all frames; weight and resistance may arrive in any order
         frames.forEach { parseFrame(it, yunmai, user) }
 
-        // Only publish meaningful data
+        // If 0x1A10 frames carried no resistance (common for this scale), try the QN resistance
+        // received on 0xFFF1. This is the primary path for body-composition on the ES-CS20M.
+        if (acc.fat == 0f && qnResistance > 0) {
+            LogManager.d(TAG, "Using QN resistance: $qnResistance Ω for body-composition calculation")
+            applyExtended(qnResistance, yunmai, user)
+        }
+
         if (acc.weight > 0f) {
             acc.userId = user.id
             if (acc.dateTime == null) acc.dateTime = Date()
@@ -203,7 +294,6 @@ class ESCS20mHandler : ScaleDeviceHandler() {
             LogManager.w(TAG, "No valid weight decoded from $weightFrameCount frames; skip publishing.")
         }
 
-        // Prepare for a fresh session
         rawFrames.clear()
         resetAccumulator()
     }
@@ -231,15 +321,10 @@ class ESCS20mHandler : ScaleDeviceHandler() {
     /**
      * Weight frame (0x14).
      *
-     * Protocol example:
-     *   55 AA 14 00 07 00 00 00 30 34 00 00 XX
-     *   - bytes[8..9] = weight in big-endian, 0.01 kg units (e.g. 0x3034 = 12340 -> 123.4 kg)
-     *   - bytes[10..11] = optional embedded resistance
-     *   - last byte = checksum
-     *
-     * Note: This scale does NOT have a per-frame "stable" flag. Instead, stability is
-     * indicated by the STOP message (0x11 with byte[5]=0x00). We keep the last valid
-     * weight value, which will be the stable reading when STOP arrives.
+     * Protocol:
+     *   55 AA 14 00 07 00 00 00 [w_hi] [w_lo] [r_hi] [r_lo] [checksum]
+     *   bytes[8..9]  = weight, big-endian, units of 0.01 kg
+     *   bytes[10..11] = optional embedded resistance (0x0000 if weight-only mode)
      */
     private fun parseWeightFrame(msg: ByteArray, calc: YunmaiLib, user: ScaleUser) {
         if (msg.size < 12) return
@@ -247,8 +332,6 @@ class ESCS20mHandler : ScaleDeviceHandler() {
         val weightRaw = u16be(msg, 8)
         val weightKg = weightRaw / 100.0f
 
-        // Only accept reasonable weight values (0.5 kg to 300 kg)
-        // This filters out garbage during initial connection
         if (weightKg < 0.5f || weightKg > 300f) {
             LogManager.d(TAG, "Ignoring unreasonable weight: $weightKg kg (raw=$weightRaw)")
             return
@@ -256,7 +339,7 @@ class ESCS20mHandler : ScaleDeviceHandler() {
 
         acc.weight = weightKg
 
-        // Embedded extended data?
+        // Embedded resistance in this frame?
         val hasEmbedded = (msg[10].toInt() and 0xFF) != 0 || (msg[11].toInt() and 0xFF) != 0
         val hasSeparateExt = rawFrames.any { it.size >= 3 && ((it[2].toInt() and 0xFF) == MSG_EXTENDED_RESP) }
 
@@ -270,7 +353,7 @@ class ESCS20mHandler : ScaleDeviceHandler() {
     }
 
     /**
-     * Extended frame (0x15): resistance at [9..10] (big-endian).
+     * Extended frame (0x15): resistance at bytes[9..10] (big-endian).
      */
     private fun parseExtendedFrame(msg: ByteArray, calc: YunmaiLib, user: ScaleUser) {
         if (msg.size < 11) return
@@ -279,13 +362,12 @@ class ESCS20mHandler : ScaleDeviceHandler() {
     }
 
     /**
-     * Compute body composition using YunmaiLib and write into accumulator.
-     * Requires a valid weight to be already present.
+     * Compute body composition from resistance using YunmaiLib and store in accumulator.
      */
     private fun applyExtended(resistance: Int, calc: YunmaiLib, user: ScaleUser) {
         val w = acc.weight
         if (w <= 0f) {
-            LogManager.d(TAG, "Weight not set yet; skip extended calculation.")
+            LogManager.d(TAG, "Weight not yet set; skipping body-composition calculation.")
             return
         }
 
@@ -304,46 +386,7 @@ class ESCS20mHandler : ScaleDeviceHandler() {
         acc.visceralFat = visceral
     }
 
-    // -------------------------------------------------------------------------
-    // Small helpers
-    // -------------------------------------------------------------------------
-
-    /**
-     * Build the 0x90 "start measurement" command with the user's body profile.
-     *
-     * Protocol: 55 AA 90 00 04 [mode] [sex] [height_cm] [age] [checksum]
-     *   mode = 0x01  (body-composition session; 0x00 would be weight-only)
-     *   sex  = 0x01 male / 0x00 female
-     *   height = cm, single byte
-     *   age    = years, single byte
-     *
-     * Sending zeros for sex/height/age causes the scale to revert to weight-only
-     * mode and omit resistance data from 0x14 frames (impedance stays 0x0000).
-     */
-    private fun buildStartCommand(user: ScaleUser): ByteArray {
-        val sex:    Byte = if (user.gender.isMale()) 0x01 else 0x00
-        val height: Byte = user.bodyHeight.toInt().coerceIn(0, 255).toByte()
-        val age:    Byte = user.age.coerceIn(0, 255).toByte()
-        return buildFrame(0x90.toByte(), byteArrayOf(0x01, sex, height, age))
-    }
-
-    /**
-     * Assemble a Lefu/Renpho frame:  55 AA [cmd] 00 [len] [payload…] [sum-checksum]
-     * Checksum = sum of every byte preceding it, truncated to 8 bits.
-     */
-    private fun buildFrame(cmd: Byte, payload: ByteArray): ByteArray {
-        val buf = ByteArray(5 + payload.size + 1)
-        buf[0] = 0x55
-        buf[1] = 0xAA.toByte()
-        buf[2] = cmd
-        buf[3] = 0x00
-        buf[4] = payload.size.toByte()
-        payload.copyInto(buf, 5)
-        var sum = 0
-        for (i in 0 until buf.size - 1) sum += buf[i].toInt() and 0xFF
-        buf[buf.size - 1] = (sum and 0xFF).toByte()
-        return buf
-    }
+    // ── Helpers ──────────────────────────────────────────────────────────────
 
     private fun u16be(b: ByteArray, off: Int): Int {
         if (off + 1 >= b.size) return 0
@@ -360,5 +403,7 @@ class ESCS20mHandler : ScaleDeviceHandler() {
         acc.bone = 0f
         acc.lbm = 0f
         acc.visceralFat = 0f
+        qnResistance = 0
+        qnProtocolType = 0x00
     }
 }
