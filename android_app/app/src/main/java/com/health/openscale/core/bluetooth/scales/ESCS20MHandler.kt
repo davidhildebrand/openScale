@@ -77,11 +77,21 @@ class ESCS20mHandler : ScaleDeviceHandler() {
     private val CHR_CUR_TIME  = uuid16(0x2A11) // control / command mailbox (WRITE only)
     private val CHR_RESULTS   = uuid16(0x2A10) // notifications with results
 
-    // ── QN-style / 0xFFF0 service ────────────────────────────────────────────
+    // ── QN-style / 0xFFF0 service (Type 2) ───────────────────────────────────
     private val SVC_FFF0 = uuid16(0xFFF0)
     private val CHR_FFF1 = uuid16(0xFFF1) // READ|WRITE|NOTIFY – primary QN channel
     private val CHR_FFF2 = uuid16(0xFFF2) // READ|WRITE|WRITE_NR|NOTIFY – command + possible notify
     private val CHR_FFF3 = uuid16(0xFFF3) // NOTIFY only – possible secondary output channel
+
+    // ── QN-style / 0xFFE0 service (Type 1 / Yunmai-style) ───────────────────
+    // Some Renpho/Lefu scales use this older service layout instead of or in addition to FFF0.
+    private val SVC_FFE0  = uuid16(0xFFE0)
+    private val CHR_FFE1  = uuid16(0xFFE1) // NOTIFY – weight + resistance (QN Type 1)
+    private val CHR_FFE2  = uuid16(0xFFE2) // INDICATE – misc ack
+    private val CHR_FFE3  = uuid16(0xFFE3) // WRITE – unit config (QN Type 1)
+    private val CHR_FFE4  = uuid16(0xFFE4) // NOTIFY – measurement (Yunmai variant)
+    private val SVC_FFE5  = uuid16(0xFFE5)
+    private val CHR_FFE9  = uuid16(0xFFE9) // WRITE – command (Yunmai variant)
 
     // "Magic" commands for the 0x1A10 service.
     // NOTE: the 0x90 payload MUST remain [01 00 00 00]; the scale rejects any other payload.
@@ -128,18 +138,34 @@ class ESCS20mHandler : ScaleDeviceHandler() {
         rawFrames.clear()
         resetAccumulator()
 
-        // Step 1: Subscribe to ALL three QN channels before doing anything else, so the
-        // body-composition channel is live when the scale starts its measurement session.
+        // ── Diagnostic: log which alternative services are present ────────────
+        // This reveals the scale's full GATT profile so we know which channels to use.
+        LogManager.d(TAG, "Service probe: FFE0/FFE1=${hasCharacteristic(SVC_FFE0, CHR_FFE1)}" +
+                " FFE0/FFE2=${hasCharacteristic(SVC_FFE0, CHR_FFE2)}" +
+                " FFE0/FFE3=${hasCharacteristic(SVC_FFE0, CHR_FFE3)}" +
+                " FFE0/FFE4=${hasCharacteristic(SVC_FFE0, CHR_FFE4)}" +
+                " FFE5/FFE9=${hasCharacteristic(SVC_FFE5, CHR_FFE9)}")
+        LogManager.d(TAG, "Service probe: FFF0/FFF1=${hasCharacteristic(SVC_FFF0, CHR_FFF1)}" +
+                " FFF0/FFF2=${hasCharacteristic(SVC_FFF0, CHR_FFF2)}" +
+                " FFF0/FFF3=${hasCharacteristic(SVC_FFF0, CHR_FFF3)}")
+
+        // ── Step 1: Subscribe to all known QN/body-comp channels ─────────────
+
+        // FFF0 service (Type 2 – already tried; scale accepts subscriptions but sends nothing)
         setNotifyOn(SVC_FFF0, CHR_FFF1)
         setNotifyOn(SVC_FFF0, CHR_FFF2)
         setNotifyOn(SVC_FFF0, CHR_FFF3)
 
-        // Step 2: Proactively send QN unit-config + time-sync to 0xFFF2 without waiting for
-        // the 0x12 scale-info frame (the scale may not send it spontaneously).
-        // qnProtocolType defaults to 0x00 here; it will be updated if 0x12 arrives later.
+        // FFE0 service (Type 1 / Yunmai – subscribe only if present)
+        if (hasCharacteristic(SVC_FFE0, CHR_FFE1)) setNotifyOn(SVC_FFE0, CHR_FFE1)
+        if (hasCharacteristic(SVC_FFE0, CHR_FFE2)) setNotifyOn(SVC_FFE0, CHR_FFE2)
+        if (hasCharacteristic(SVC_FFE0, CHR_FFE4)) setNotifyOn(SVC_FFE0, CHR_FFE4)
+
+        // ── Step 2: Proactively send QN unit-config + time-sync ──────────────
+        // Write to both FFF2 (Type 2) and FFE3 (Type 1) so whichever is active receives it.
         sendQnConfig(user)
 
-        // Step 3: Subscribe to Lefu weight service and kick off measurement.
+        // ── Step 3: Subscribe to Lefu weight service and kick off measurement ─
         // The 0x90 payload [01 00 00 00] must stay as-is; the scale rejects any other payload.
         setNotifyOn(SVC_MAIN, CHR_RESULTS)
         writeTo(SVC_MAIN, CHR_CUR_TIME, MAGIC_START_MEAS)
@@ -155,6 +181,9 @@ class ESCS20mHandler : ScaleDeviceHandler() {
             CHR_FFF1 -> handleQnFrame(data, user, "0xFFF1")
             CHR_FFF2 -> handleQnFrame(data, user, "0xFFF2")
             CHR_FFF3 -> handleQnFrame(data, user, "0xFFF3")
+            CHR_FFE1 -> handleQnFrame(data, user, "0xFFE1")
+            CHR_FFE2 -> handleQnFrame(data, user, "0xFFE2")
+            CHR_FFE4 -> handleQnFrame(data, user, "0xFFE4")
             CHR_RESULTS, CHR_CUR_TIME -> handleLefuFrame(data, user)
             else -> LogManager.d(TAG, "Notify from unrelated chr=$characteristic len=${data.size}")
         }
@@ -213,7 +242,6 @@ class ESCS20mHandler : ScaleDeviceHandler() {
         // 0x13 unit-configuration frame
         val cfg = byteArrayOf(0x13, 0x09, qnProtocolType, unitByte, 0x10, 0x00, 0x00, 0x00, 0x00)
         cfg[cfg.lastIndex] = qnChecksum(cfg)
-        writeTo(SVC_FFF0, CHR_FFF2, cfg, withResponse = false)
 
         // 0x02 time-sync frame (seconds since QN epoch 2000-01-01, little-endian)
         val epochSecs = ((System.currentTimeMillis() / 1000L) - QN_EPOCH_OFFSET_SEC).toInt()
@@ -224,7 +252,16 @@ class ESCS20mHandler : ScaleDeviceHandler() {
             ((epochSecs ushr 16) and 0xFF).toByte(),
             ((epochSecs ushr 24) and 0xFF).toByte()
         )
+
+        // Send to FFF2 (QN Type 2) – already confirmed present on this scale
+        writeTo(SVC_FFF0, CHR_FFF2, cfg, withResponse = false)
         writeTo(SVC_FFF0, CHR_FFF2, timeSync, withResponse = false)
+
+        // Send to FFE3 (QN Type 1) – only if present; the adapter ignores missing characteristics
+        if (hasCharacteristic(SVC_FFE0, CHR_FFE3)) {
+            writeTo(SVC_FFE0, CHR_FFE3, cfg, withResponse = false)
+            writeTo(SVC_FFE0, CHR_FFE3, timeSync, withResponse = false)
+        }
 
         LogManager.d(TAG, "QN config sent: unit=kg, time-sync epochSecs=$epochSecs")
     }
@@ -387,6 +424,7 @@ class ESCS20mHandler : ScaleDeviceHandler() {
         val lbm = calc.getLeanBodyMass(w, fat)
         val visceral = calc.getVisceralFat(fat, user.age)
 
+        acc.impedance = resistance.toDouble()
         acc.fat = fat
         acc.muscle = musclePct
         acc.water = waterPct
