@@ -22,108 +22,102 @@ import com.health.openscale.core.bluetooth.data.ScaleUser
 import com.health.openscale.core.bluetooth.libs.YunmaiLib
 import com.health.openscale.core.service.ScannedDeviceInfo
 import com.health.openscale.core.utils.LogManager
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
 
 /**
- * Handler for ES-CS20M scales (Yunmai / Lefu lineage).
+ * Handler for ES-CS20M scales (Renpho / Lefu lineage).
  *
- * The scale exposes TWO vendor services:
+ * Protocol (reverse-engineered from Android HCI btsnoop capture of official Renpho app,
+ * 2026-03-07; all traffic uses the 0x1A10 service — 0xFFF0 / QN channels are NOT used):
  *
- *  1. 0x1A10 (Lefu/Renpho weight service)
- *       0x2A11 WRITE – "start measurement" and "delete history" commands
- *       0x2A10 NOTIFY – weight frames (0x11 start/stop, 0x14 weight)
- *     → Delivers weight only; impedance bytes are always 0x0000 in 0x14 frames.
+ * Frame format: 55 AA [cmd] 00 [len] [payload…] [sum-checksum]
+ * Checksum = sum of all preceding bytes mod 256.
  *
- *  2. 0xFFF0 (QN-style body-composition service)
- *       0xFFF1 NOTIFY – QN protocol frames (0x12 scale info, 0x10 weight + resistance)
- *       0xFFF2 WRITE  – QN protocol commands (0x13 unit config, 0x02 time sync)
- *     → Delivers weight + resistance (impedance) for body-composition calculation.
+ * Commands written to CHR_CUR_TIME (0x2A11):
+ *   0x97  User-profile: 01 00 00 [unix_ts_be4] 01 06
+ *            field[7]=0x01 is a constant (NOT sex); field[8]=0x06 is a constant.
+ *   0x96  Config/save:  [sex] [year_be2] [month] [day] [height_mm_be2] 00 00 [weight_raw_be2] [mode] 01 05
+ *            sex=0x11 male, 0x21 female  (first byte, NOT the second-to-last)
+ *            mode=0xAA standard, 0x6A athlete (activity=EXTREME maps to athlete)
+ *   0x90  Start meas:   01 00 01 00   ← byte[2]=0x01 enables BIA mode
+ *   0x99  Interim ACK:  01
  *
- * Protocol flow:
- *   onConnected → setNotifyOn(0x2A10) + setNotifyOn(0xFFF1)
- *               → write 0x90 start to 0x2A11
- *               → write 0x95 delete-history to 0x2A11
- *   scale → 0x11 START (0x2A10)
- *   scale → 0x12 scale-info (0xFFF1) → app replies: 0x13 unit-cfg + 0x02 time-sync to 0xFFF2
- *   scale → 0x14 weight frames (0x2A10, many)
- *   scale → 0x10 stable weight+resistance (0xFFF1)  ← impedance arrives here
- *   scale → 0x11 STOP (0x2A10)  → parseAllFramesAndPublish()
+ * Notifications received on CHR_RESULTS (0x2A10):
+ *   0x11  START/STOP          byte[5]=0x01 start, 0x00 stop
+ *   0x14  Weight frame        frame[8:9]=weight u16be/100=kg (resistance bytes always 0x0000)
+ *   0x16  History-save ACK    payload=0x01 (no body-comp data)
+ *   0x17  Profile ACK         payload=0x01 0x01
+ *   0x18  Final BIA result    frame[10:11]=weight, frame[12:13]=r1(Ω), frame[14:15]=r2(Ω)
+ *   0x19  Interim BIA result  frame[11:12]=weight, frame[13:14]=r1(Ω) — multi-fragment
+ *   0x10  Op callback         frame[5]=0x01 success, 0x00 failure
  *
- * Body composition (fat%, water%, muscle%, bone, LBM, visceral fat) is computed
- * via YunmaiLib using the resistance value received on 0xFFF1.
+ * Connection sequence:
+ *   onConnected → setNotifyOn(CHR_RESULTS) + write 0x97
+ *   (0x17 ACK) → write 0x96 (pre-meas, with user.initialWeight as reference weight)
+ *   (0x16 ACK) → write 0x90
+ *   scale sends 0x14 weight frames × N
+ *   scale sends 0x19 intermediate BIA → write 0x99 + 0x96 (intermediate weight)
+ *   scale sends 0x18 final BIA → extract r1 → write 0x96 × 2 (final weight)
+ *   scale sends 0x11 STOP → publish measurement
+ *
+ * Long frames (e.g. 0x19, 26 bytes) exceed ATT MTU and are fragmented by the scale into
+ * two ATT notifications using a 3-byte prefix: 0xAD=first fragment, 0xAF=continuation.
  */
 class ESCS20mHandler : ScaleDeviceHandler() {
 
     companion object {
         private const val TAG = "ESCS20mHandler"
 
-        // Message IDs (byte[2] in 0x1A10 / Lefu frames)
-        private const val MSG_START_STOP_RESP: Int = 0x11
-        private const val MSG_WEIGHT_RESP:     Int = 0x14
-        private const val MSG_EXTENDED_RESP:   Int = 0x15
+        // Lefu frame message IDs (frame byte[2])
+        private const val MSG_OP_CALLBACK:  Int = 0x10  // result of 0x90/0x99 commands
+        private const val MSG_START_STOP:   Int = 0x11  // byte[5]=0x01 start, 0x00 stop
+        private const val MSG_WEIGHT:       Int = 0x14  // weight frame (~5 Hz)
+        private const val MSG_HIST_ACK:     Int = 0x16  // ACK to 0x96 history saves
+        private const val MSG_PROFILE_ACK:  Int = 0x17  // ACK to 0x97 user-profile write
+        private const val MSG_BIA_FINAL:    Int = 0x18  // final BIA result
+        private const val MSG_BIA_INTERIM:  Int = 0x19  // intermediate BIA (may be fragmented)
 
-        // START/STOP indicator position in MSG_START_STOP_RESP frames
-        // byte[5] = 0x01 -> START, byte[5] = 0x00 -> STOP
-        private const val START_STOP_FLAG_INDEX: Int = 5
+        // Position of the START/STOP flag in 0x11 frames
+        private const val START_STOP_IDX = 5
 
-        // QN epoch offset: seconds between Unix epoch (1970) and QN epoch (2000-01-01 UTC)
-        private const val QN_EPOCH_OFFSET_SEC = 946_702_800L
+        // Multi-fragment encoding: scale splits frames > ATT MTU into two notifications
+        // with a 3-byte prefix. First fragment: 0xAD xx xx [data…], continuation: 0xAF xx xx [data…]
+        private const val FRAG_FIRST = 0xAD
+        private const val FRAG_CONT  = 0xAF
+        private const val FRAG_HDR   = 3     // prefix bytes to skip (prefix + 2 unknown bytes)
+
+        // Connection phases (connPhase):
+        private const val PHASE_WAIT_PROFILE_ACK = 0  // sent 0x97, waiting for 0x17
+        private const val PHASE_WAIT_HIST_ACK    = 1  // sent 0x96 pre-meas, waiting for 0x16
+        private const val PHASE_MEASURING        = 2  // sent 0x90, receiving 0x14 frames
+        private const val PHASE_BIA_DONE         = 3  // received 0x18, sent post-BIA 0x96 × 2
     }
 
-    // ── Lefu / 0x1A10 service ────────────────────────────────────────────────
-    private val SVC_MAIN      = uuid16(0x1A10)
-    private val CHR_CUR_TIME  = uuid16(0x2A11) // control / command mailbox (WRITE only)
-    private val CHR_RESULTS   = uuid16(0x2A10) // notifications with results
+    // GATT service / characteristic UUIDs for the 0x1A10 Lefu service
+    private val SVC_MAIN     = uuid16(0x1A10)
+    private val CHR_CUR_TIME = uuid16(0x2A11)  // write commands here
+    private val CHR_RESULTS  = uuid16(0x2A10)  // receive notifications here
 
-    // ── QN-style / 0xFFF0 service (Type 2) ───────────────────────────────────
-    private val SVC_FFF0 = uuid16(0xFFF0)
-    private val CHR_FFF1 = uuid16(0xFFF1) // READ|WRITE|NOTIFY – primary QN channel
-    private val CHR_FFF2 = uuid16(0xFFF2) // READ|WRITE|WRITE_NR|NOTIFY – command + possible notify
-    private val CHR_FFF3 = uuid16(0xFFF3) // NOTIFY only – possible secondary output channel
+    // ── Session state ─────────────────────────────────────────────────────────
 
-    // ── QN-style / 0xFFE0 service (Type 1 / Yunmai-style) ───────────────────
-    // Some Renpho/Lefu scales use this older service layout instead of or in addition to FFF0.
-    private val SVC_FFE0  = uuid16(0xFFE0)
-    private val CHR_FFE1  = uuid16(0xFFE1) // NOTIFY – weight + resistance (QN Type 1)
-    private val CHR_FFE2  = uuid16(0xFFE2) // INDICATE – misc ack
-    private val CHR_FFE3  = uuid16(0xFFE3) // WRITE – unit config (QN Type 1)
-    private val CHR_FFE4  = uuid16(0xFFE4) // NOTIFY – measurement (Yunmai variant)
-    private val SVC_FFE5  = uuid16(0xFFE5)
-    private val CHR_FFE9  = uuid16(0xFFE9) // WRITE – command (Yunmai variant)
-
-    // "Magic" commands for the 0x1A10 service.
-    // NOTE: the 0x90 payload MUST remain [01 00 00 00]; the scale rejects any other payload.
-    // User profile (sex/height/age) is communicated via the QN 0x13 command on 0xFFF2 instead.
-    private val MAGIC_START_MEAS = byteArrayOf(
-        0x55, 0xAA.toByte(), 0x90.toByte(), 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x94.toByte()
-    )
-    private val MAGIC_DELETE_HISTORY = byteArrayOf(
-        0x55, 0xAA.toByte(), 0x95.toByte(), 0x00, 0x01, 0x01, 0x96.toByte()
-    )
-
-    // ── Session state ────────────────────────────────────────────────────────
-    private val rawFrames = mutableListOf<ByteArray>()  // 0x1A10 frame buffer
     private val acc = ScaleMeasurement()
 
-    // QN-protocol state
-    private var qnProtocolType: Byte = 0x00  // captured from 0x12 frame; echoed in 0x13 reply
-    private var qnResistance: Int = 0        // resistance (Ω) received on 0xFFF1 0x10 frame
+    private var connPhase    = PHASE_WAIT_PROFILE_ACK
+    private var biaResistance = 0   // Ω from 0x18 final BIA frame (r1, primary)
+    private var lastWeightRaw = 0   // most recent weight from 0x14 frames, u16be (units: 0.01 kg)
+    private var lefuFrag: ByteArray? = null  // reassembly buffer for fragmented 0x19 frames
 
-    // ── Device identification ────────────────────────────────────────────────
+    // ── Device identification ─────────────────────────────────────────────────
 
     override fun supportFor(device: ScannedDeviceInfo): DeviceSupport? {
-        val name = device.name.lowercase(Locale.ROOT)
+        val name   = device.name.lowercase(Locale.ROOT)
         val hasSvc = device.serviceUuids.any { it == SVC_MAIN }
-        val looksEscs20m = hasSvc || name.contains("ES-CS20M".lowercase())
+        if (!hasSvc && !name.contains("es-cs20m")) return null
 
-        if (!looksEscs20m) return null
-
-        val caps = setOf(
-            DeviceCapability.BODY_COMPOSITION,
-            DeviceCapability.LIVE_WEIGHT_STREAM
-        )
+        val caps = setOf(DeviceCapability.BODY_COMPOSITION, DeviceCapability.LIVE_WEIGHT_STREAM)
         return DeviceSupport(
             displayName = "ES-CS20M",
             capabilities = caps,
@@ -132,216 +126,284 @@ class ESCS20mHandler : ScaleDeviceHandler() {
         )
     }
 
-    // ── Connection sequencing ────────────────────────────────────────────────
+    // ── Connection sequencing ─────────────────────────────────────────────────
 
     override fun onConnected(user: ScaleUser) {
-        rawFrames.clear()
-        resetAccumulator()
+        resetState()
 
-        // ── Diagnostic: log which alternative services are present ────────────
-        // This reveals the scale's full GATT profile so we know which channels to use.
-        LogManager.d(TAG, "Service probe: FFE0/FFE1=${hasCharacteristic(SVC_FFE0, CHR_FFE1)}" +
-                " FFE0/FFE2=${hasCharacteristic(SVC_FFE0, CHR_FFE2)}" +
-                " FFE0/FFE3=${hasCharacteristic(SVC_FFE0, CHR_FFE3)}" +
-                " FFE0/FFE4=${hasCharacteristic(SVC_FFE0, CHR_FFE4)}" +
-                " FFE5/FFE9=${hasCharacteristic(SVC_FFE5, CHR_FFE9)}")
-        LogManager.d(TAG, "Service probe: FFF0/FFF1=${hasCharacteristic(SVC_FFF0, CHR_FFF1)}" +
-                " FFF0/FFF2=${hasCharacteristic(SVC_FFF0, CHR_FFF2)}" +
-                " FFF0/FFF3=${hasCharacteristic(SVC_FFF0, CHR_FFF3)}")
-
-        // ── Step 1: Subscribe to all known QN/body-comp channels ─────────────
-
-        // FFF0 service (Type 2 – already tried; scale accepts subscriptions but sends nothing)
-        setNotifyOn(SVC_FFF0, CHR_FFF1)
-        setNotifyOn(SVC_FFF0, CHR_FFF2)
-        setNotifyOn(SVC_FFF0, CHR_FFF3)
-
-        // FFE0 service (Type 1 / Yunmai – subscribe only if present)
-        if (hasCharacteristic(SVC_FFE0, CHR_FFE1)) setNotifyOn(SVC_FFE0, CHR_FFE1)
-        if (hasCharacteristic(SVC_FFE0, CHR_FFE2)) setNotifyOn(SVC_FFE0, CHR_FFE2)
-        if (hasCharacteristic(SVC_FFE0, CHR_FFE4)) setNotifyOn(SVC_FFE0, CHR_FFE4)
-
-        // ── Step 2: Proactively send QN unit-config + time-sync ──────────────
-        // Write to both FFF2 (Type 2) and FFE3 (Type 1) so whichever is active receives it.
-        sendQnConfig(user)
-
-        // ── Step 3: Subscribe to Lefu weight service and kick off measurement ─
-        // The 0x90 payload [01 00 00 00] must stay as-is; the scale rejects any other payload.
+        // Subscribe to weight/BIA notifications, then immediately send the user-profile command.
+        // The scale auto-starts and begins sending 0x14 weight frames on subscribe; we ignore
+        // those until the full setup sequence (0x97 → 0x96 → 0x90) completes.
         setNotifyOn(SVC_MAIN, CHR_RESULTS)
-        writeTo(SVC_MAIN, CHR_CUR_TIME, MAGIC_START_MEAS)
-        writeTo(SVC_MAIN, CHR_CUR_TIME, MAGIC_DELETE_HISTORY)
-
-        LogManager.i(TAG, "Session started; waiting for frames…")
+        writeTo(SVC_MAIN, CHR_CUR_TIME, buildCmd97())
+        LogManager.i(TAG, "Session started; wrote 0x97 user-profile")
     }
 
-    // ── Notification handling ────────────────────────────────────────────────
+    // ── Notification dispatch ─────────────────────────────────────────────────
 
     override fun onNotification(characteristic: UUID, data: ByteArray, user: ScaleUser) {
-        when (characteristic) {
-            CHR_FFF1 -> handleQnFrame(data, user, "0xFFF1")
-            CHR_FFF2 -> handleQnFrame(data, user, "0xFFF2")
-            CHR_FFF3 -> handleQnFrame(data, user, "0xFFF3")
-            CHR_FFE1 -> handleQnFrame(data, user, "0xFFE1")
-            CHR_FFE2 -> handleQnFrame(data, user, "0xFFE2")
-            CHR_FFE4 -> handleQnFrame(data, user, "0xFFE4")
-            CHR_RESULTS, CHR_CUR_TIME -> handleLefuFrame(data, user)
-            else -> LogManager.d(TAG, "Notify from unrelated chr=$characteristic len=${data.size}")
-        }
+        if (characteristic == CHR_RESULTS) handleLefuNotification(data, user)
     }
 
-    // ── 0xFFF1 / QN-protocol frame handler ───────────────────────────────────
+    // ── Fragment reassembly ───────────────────────────────────────────────────
 
     /**
-     * Handle frames arriving on 0xFFF1 (QN-style body-composition service).
-     *
-     * 0x12 scale-info  → capture protocol type, send 0x13 unit-cfg + 0x02 time-sync to 0xFFF2.
-     * 0x10 live frame  → when stable flag set, extract resistance for body-composition calc.
+     * The scale uses a custom 2-part fragmentation for frames that exceed the ATT MTU.
+     * First fragment:        0xAD xx xx [partial Lefu frame…]
+     * Continuation fragment: 0xAF xx xx [remainder…]
+     * Regular frames start with 0x55 and are passed through unchanged.
      */
-    private fun handleQnFrame(data: ByteArray, user: ScaleUser, chrLabel: String = "0xFFF1") {
+    private fun handleLefuNotification(data: ByteArray, user: ScaleUser) {
         if (data.isEmpty()) return
 
-        val hex = data.joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
-        LogManager.d(TAG, "QN $chrLabel len=${data.size}: [$hex]")
-
         when (data[0].toInt() and 0xFF) {
-            0x12 -> {
-                // Scale-info frame: capture protocol type, then send QN configuration
-                qnProtocolType = if (data.size > 2) data[2] else 0x00
-                LogManager.d(TAG, "QN 0x12 scale-info: protocol=0x%02X".format(qnProtocolType.toInt() and 0xFF))
-                sendQnConfig(user)
+            FRAG_FIRST -> {
+                lefuFrag = data.drop(FRAG_HDR).toByteArray()
             }
-            0x10 -> {
-                // Live weight + resistance frame.
-                // Original QN format: [opcode][len?][proto][weight_hi][weight_lo][stable][r1_hi][r1_lo][r2_hi][r2_lo]
-                if (data.size < 10) {
-                    LogManager.d(TAG, "QN 0x10 frame too short (${data.size} bytes)")
+            FRAG_CONT -> {
+                val frag = lefuFrag
+                if (frag == null) {
+                    LogManager.w(TAG, "Continuation fragment without a preceding first fragment; discarded")
                     return
                 }
-                val stable = data[5].toInt() == 1
-                if (!stable) {
-                    LogManager.d(TAG, "QN 0x10 unstable weight frame; skipping")
-                    return
-                }
-                val resistance = ((data[6].toInt() and 0xFF) shl 8) or (data[7].toInt() and 0xFF)
-                LogManager.d(TAG, "QN 0x10 stable: resistance=$resistance Ω (bytes[6:7])")
-                if (resistance > 0) {
-                    qnResistance = resistance
-                }
+                val complete = frag + data.drop(FRAG_HDR)
+                lefuFrag = null
+                handleLefuFrame(complete, user)
             }
-            else -> LogManager.d(TAG, "QN unhandled opcode=0x%02X".format(data[0].toInt() and 0xFF))
-        }
-    }
-
-    /**
-     * Send the QN unit-configuration and time-sync commands to 0xFFF2.
-     * Must be called after receiving the 0x12 scale-info frame so [qnProtocolType] is known.
-     */
-    private fun sendQnConfig(user: ScaleUser) {
-        val unitByte: Byte = 0x01 // kg (0x02 = lb)
-
-        // 0x13 unit-configuration frame
-        val cfg = byteArrayOf(0x13, 0x09, qnProtocolType, unitByte, 0x10, 0x00, 0x00, 0x00, 0x00)
-        cfg[cfg.lastIndex] = qnChecksum(cfg)
-
-        // 0x02 time-sync frame (seconds since QN epoch 2000-01-01, little-endian)
-        val epochSecs = ((System.currentTimeMillis() / 1000L) - QN_EPOCH_OFFSET_SEC).toInt()
-        val timeSync = byteArrayOf(
-            0x02,
-            (epochSecs and 0xFF).toByte(),
-            ((epochSecs ushr 8)  and 0xFF).toByte(),
-            ((epochSecs ushr 16) and 0xFF).toByte(),
-            ((epochSecs ushr 24) and 0xFF).toByte()
-        )
-
-        // Send to FFF2 (QN Type 2) – already confirmed present on this scale
-        writeTo(SVC_FFF0, CHR_FFF2, cfg, withResponse = false)
-        writeTo(SVC_FFF0, CHR_FFF2, timeSync, withResponse = false)
-
-        // Send to FFE3 (QN Type 1) – only if present; the adapter ignores missing characteristics
-        if (hasCharacteristic(SVC_FFE0, CHR_FFE3)) {
-            writeTo(SVC_FFE0, CHR_FFE3, cfg, withResponse = false)
-            writeTo(SVC_FFE0, CHR_FFE3, timeSync, withResponse = false)
-        }
-
-        LogManager.d(TAG, "QN config sent: unit=kg, time-sync epochSecs=$epochSecs")
-    }
-
-    /** Sum-of-bytes checksum used by the QN protocol (excludes the last byte). */
-    private fun qnChecksum(buf: ByteArray): Byte {
-        var s = 0
-        for (i in 0 until buf.size - 1) s = (s + (buf[i].toInt() and 0xFF)) and 0xFF
-        return s.toByte()
-    }
-
-    // ── 0x2A10 / Lefu-protocol frame handler ─────────────────────────────────
-
-    /**
-     * Buffer all Lefu frames; take action only on 0x11 START/STOP frames.
-     *
-     * Protocol (from captured traffic):
-     *   START frame: 55 AA 11 00 0A 01 01 01 00 00 39 00 00 00 00 56  (byte[5] = 0x01)
-     *   STOP  frame: 55 AA 11 00 0A 00 01 01 00 00 39 00 00 00 00 55  (byte[5] = 0x00)
-     */
-    private fun handleLefuFrame(data: ByteArray, user: ScaleUser) {
-        rawFrames += data.copyOf()
-
-        if (data.size < 3) return
-        val msgId = data[2].toInt() and 0xFF
-        if (msgId != MSG_START_STOP_RESP) return
-
-        if (data.size < 6) return
-        val startStopFlag = data[START_STOP_FLAG_INDEX].toInt() and 0xFF
-
-        when {
-            startStopFlag != 0 -> LogManager.d(TAG, "Measurement started (flag=$startStopFlag)")
             else -> {
-                LogManager.d(TAG, "Measurement stopped (flag=$startStopFlag) → parse & publish")
-                parseAllFramesAndPublish(user)
+                lefuFrag = null
+                handleLefuFrame(data, user)
             }
         }
     }
 
-    override fun onDisconnected() {
-        rawFrames.clear()
-        resetAccumulator()
+    // ── Lefu frame handler ────────────────────────────────────────────────────
+
+    private fun handleLefuFrame(data: ByteArray, user: ScaleUser) {
+        if (data.size < 3) return
+
+        val msgId = data[2].toInt() and 0xFF
+        val hex   = data.joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
+        LogManager.d(TAG, "Lefu 0x%02X len=%d [%s]".format(msgId, data.size, hex))
+
+        when (msgId) {
+            MSG_PROFILE_ACK -> onProfileAck(user)
+            MSG_HIST_ACK    -> onHistAck(user)
+            MSG_WEIGHT      -> onWeightFrame(data)
+            MSG_BIA_INTERIM -> onBiaInterim(data, user)
+            MSG_BIA_FINAL   -> onBiaFinal(data, user)
+            MSG_START_STOP  -> onStartStop(data, user)
+        }
     }
 
-    // ── Parsing and publishing ────────────────────────────────────────────────
+    // ── Per-message handlers ──────────────────────────────────────────────────
 
-    private fun parseAllFramesAndPublish(user: ScaleUser) {
-        if (rawFrames.isEmpty()) {
-            LogManager.w(TAG, "No frames buffered; nothing to publish.")
+    /** 0x17 – Scale acknowledged our 0x97 user-profile write. Send pre-meas 0x96. */
+    private fun onProfileAck(user: ScaleUser) {
+        if (connPhase != PHASE_WAIT_PROFILE_ACK) return
+        val refWeightRaw = (user.initialWeight.coerceAtLeast(0f) * 100f).toInt()
+        LogManager.d(TAG, "0x17 profile ACK → sending pre-meas 0x96 (refWeight=${refWeightRaw/100f}kg)")
+        writeTo(SVC_MAIN, CHR_CUR_TIME, buildCmd96(user, refWeightRaw))
+        connPhase = PHASE_WAIT_HIST_ACK
+    }
+
+    /**
+     * 0x16 – Scale acknowledged a 0x96 history-save write.
+     * During setup (PHASE_WAIT_HIST_ACK): this is the pre-meas ACK → send 0x90 to start BIA.
+     * During/after measurement: these are history-save ACKs → no action needed.
+     */
+    private fun onHistAck(user: ScaleUser) {
+        if (connPhase == PHASE_WAIT_HIST_ACK) {
+            LogManager.d(TAG, "0x16 pre-meas ACK → sending 0x90 start (BIA-enabled)")
+            writeTo(SVC_MAIN, CHR_CUR_TIME, buildCmd90())
+            connPhase = PHASE_MEASURING
+        } else {
+            LogManager.d(TAG, "0x16 history-save ACK (phase=$connPhase)")
+        }
+    }
+
+    /** 0x14 – Weight frame. Track the most recent weight for post-BIA 0x96 payload. */
+    private fun onWeightFrame(data: ByteArray) {
+        if (data.size < 12) return
+        val raw = u16be(data, 8)
+        if (raw > 0) lastWeightRaw = raw
+    }
+
+    /**
+     * 0x19 – Intermediate BIA result (arrives mid-measurement, before final stable reading).
+     * The scale expects 0x99 ACK + 0x96 save (using the intermediate weight) in response.
+     *
+     * Frame layout (after fragment reassembly, frame[0]=0x55):
+     *   frame[11:12] = intermediate weight (u16be / 100 = kg)
+     *   frame[13:14] = r1 primary resistance (Ω)
+     *   frame[15:16] = r2 secondary resistance (Ω)
+     */
+    private fun onBiaInterim(data: ByteArray, user: ScaleUser) {
+        val interimWeightRaw = if (data.size >= 13) u16be(data, 11) else lastWeightRaw
+        LogManager.d(TAG, "0x19 interim BIA: weight=${interimWeightRaw/100f}kg → 0x99 + 0x96")
+        writeTo(SVC_MAIN, CHR_CUR_TIME, buildCmd99())
+        writeTo(SVC_MAIN, CHR_CUR_TIME, buildCmd96(user, interimWeightRaw))
+    }
+
+    /**
+     * 0x18 – Final BIA result. Extract primary resistance, then send two 0x96 history saves.
+     *
+     * Frame layout (frame[0]=0x55):
+     *   frame[10:11] = final stable weight (u16be / 100 = kg)
+     *   frame[12:13] = r1 primary resistance (Ω)  ← used for body-composition calculation
+     *   frame[14:15] = r2 secondary resistance (Ω)
+     */
+    private fun onBiaFinal(data: ByteArray, user: ScaleUser) {
+        if (data.size < 16) {
+            LogManager.w(TAG, "0x18 frame too short (${data.size}); BIA data unavailable")
+            return
+        }
+        val finalWeightRaw = u16be(data, 10)
+        val r1 = u16be(data, 12)
+        val r2 = u16be(data, 14)
+        LogManager.i(TAG, "0x18 final BIA: weight=${finalWeightRaw/100f}kg r1=${r1}Ω r2=${r2}Ω")
+
+        if (r1 > 0) biaResistance = r1
+        if (finalWeightRaw > 0) lastWeightRaw = finalWeightRaw
+
+        // Send two post-BIA 0x96 history-save commands using the final stable weight
+        val postSave = buildCmd96(user, lastWeightRaw)
+        writeTo(SVC_MAIN, CHR_CUR_TIME, postSave)
+        writeTo(SVC_MAIN, CHR_CUR_TIME, postSave)
+        connPhase = PHASE_BIA_DONE
+    }
+
+    /** 0x11 – Measurement START or STOP. STOP triggers parsing and publishing. */
+    private fun onStartStop(data: ByteArray, user: ScaleUser) {
+        if (data.size < 6) return
+        val flag = data[START_STOP_IDX].toInt() and 0xFF
+        if (flag != 0) {
+            LogManager.d(TAG, "0x11 START (flag=$flag)")
+        } else {
+            LogManager.d(TAG, "0x11 STOP → publishing")
+            publishMeasurement(user)
+        }
+    }
+
+    override fun onDisconnected() = resetState()
+
+    // ── Command builders ──────────────────────────────────────────────────────
+
+    /**
+     * Build a Lefu frame: 55 AA [cmd] 00 [len] [payload…] [checksum]
+     * Checksum = sum of all preceding bytes mod 256.
+     */
+    private fun buildLefuFrame(cmd: Int, payload: ByteArray): ByteArray {
+        val frame = ByteArray(5 + payload.size + 1)
+        frame[0] = 0x55
+        frame[1] = 0xAA.toByte()
+        frame[2] = cmd.toByte()
+        frame[3] = 0x00
+        frame[4] = payload.size.toByte()
+        payload.copyInto(frame, 5)
+        var sum = 0
+        for (i in 0 until frame.size - 1) sum = (sum + (frame[i].toInt() and 0xFF)) and 0xFF
+        frame[frame.size - 1] = sum.toByte()
+        return frame
+    }
+
+    /**
+     * 0x97 user-profile command (9-byte payload):
+     *   01 00 00 [unix_ts_be4] 01 06
+     *
+     * unix_ts = current time in seconds since Unix epoch, big-endian uint32.
+     * Bytes [7]=0x01 and [8]=0x06 are constants (confirmed across male and female profiles —
+     * sex is NOT encoded here; see buildCmd96 for sex encoding).
+     */
+    private fun buildCmd97(): ByteArray {
+        val ts = (System.currentTimeMillis() / 1000L).toInt()
+        val payload = byteArrayOf(
+            0x01, 0x00, 0x00,
+            (ts ushr 24).toByte(), (ts ushr 16).toByte(), (ts ushr 8).toByte(), ts.toByte(),
+            0x01,  // constant (confirmed; NOT sex)
+            0x06   // constant (confirmed)
+        )
+        return buildLefuFrame(0x97, payload)
+    }
+
+    /**
+     * 0x96 config/history-save command (14-byte payload):
+     *   [sex] [year_be2] [month] [day] [height_mm_be2] 00 00 [weightRaw_be2] [mode] 01 05
+     *
+     * sex      = FIRST byte: 0x11 male, 0x21 female (confirmed by multi-profile capture).
+     * year/month/day = extracted from user.birthday (Calendar.MONTH is 0-indexed, +1 for 1–12).
+     * height_mm = user.bodyHeight (cm) × 10, big-endian uint16.
+     * weightRaw = weight in units of 0.01 kg, big-endian uint16.
+     * mode     = 0xAA standard, 0x6A athlete (EXTREME activity maps to athlete mode).
+     * 0x01     = constant (confirmed; the byte after mode is always 0x01, not sex).
+     * 0x05     = constant trailing byte (confirmed).
+     */
+    private fun buildCmd96(user: ScaleUser, weightRaw: Int): ByteArray {
+        val cal      = Calendar.getInstance().also { it.time = user.birthday }
+        val year     = cal.get(Calendar.YEAR)
+        val month    = cal.get(Calendar.MONTH) + 1      // Calendar.MONTH: 0=Jan…11=Dec
+        val day      = cal.get(Calendar.DAY_OF_MONTH)
+        val heightMm = (user.bodyHeight * 10f).toInt()  // cm → mm, big-endian uint16
+        val sexByte  = if (user.gender.isMale()) 0x11 else 0x21
+        val modeByte = if (YunmaiLib.toYunmaiActivityLevel(user.activityLevel) == 1) 0x6A else 0xAA
+        val payload  = byteArrayOf(
+            sexByte.toByte(),
+            (year ushr 8).toByte(), year.toByte(),
+            month.toByte(),
+            day.toByte(),
+            (heightMm ushr 8).toByte(), heightMm.toByte(),
+            0x00, 0x00,
+            (weightRaw ushr 8).toByte(), weightRaw.toByte(),
+            modeByte.toByte(),
+            0x01,  // constant (confirmed; NOT sex)
+            0x05   // constant (confirmed)
+        )
+        return buildLefuFrame(0x96, payload)
+    }
+
+    /**
+     * 0x90 start-measurement command.
+     * Payload byte[2] = 0x01 enables BIA mode (vs. 0x00 which gives weight-only).
+     */
+    private fun buildCmd90(): ByteArray =
+        buildLefuFrame(0x90, byteArrayOf(0x01, 0x00, 0x01, 0x00))
+
+    /** 0x99 ACK to the 0x19 intermediate-BIA frame. */
+    private fun buildCmd99(): ByteArray =
+        buildLefuFrame(0x99, byteArrayOf(0x01))
+
+    // ── Publish ───────────────────────────────────────────────────────────────
+
+    private fun publishMeasurement(user: ScaleUser) {
+        val weightKg = lastWeightRaw / 100.0f
+        if (weightKg < 0.5f || weightKg > 300f) {
+            LogManager.w(TAG, "No valid weight at publish time (lastWeightRaw=$lastWeightRaw); skipped")
+            resetState()
             return
         }
 
-        val sex = if (user.gender.isMale()) 1 else 0
-        val yunmai = YunmaiLib(sex, user.bodyHeight, user.activityLevel)
+        acc.weight = weightKg
+        LogManager.i(TAG, "Weight: ${weightKg}kg  BIA resistance: ${biaResistance}Ω")
 
-        // Sort frames by msgId (legacy behaviour)
-        val frames = rawFrames.sortedBy { (it.getOrNull(2)?.toInt() ?: 0) and 0xFF }
-        val weightFrameCount = frames.count { it.size >= 3 && (it[2].toInt() and 0xFF) == MSG_WEIGHT_RESP }
-        LogManager.d(TAG, "Parsing ${frames.size} frames ($weightFrameCount weight frames)…")
-
-        frames.forEach { parseFrame(it, yunmai, user) }
-
-        // If 0x1A10 frames carried no resistance (common for this scale), try the QN resistance
-        // received on 0xFFF1. This is the primary path for body-composition on the ES-CS20M.
-        if (acc.fat == 0f && qnResistance > 0) {
-            LogManager.d(TAG, "Using QN resistance: $qnResistance Ω for body-composition calculation")
-            applyExtended(qnResistance, yunmai, user)
+        if (biaResistance > 0) {
+            val sex   = if (user.gender.isMale()) 1 else 0
+            val calc  = YunmaiLib(sex, user.bodyHeight, user.activityLevel)
+            val fat   = calc.getFat(user.age, weightKg, biaResistance)
+            acc.impedance   = biaResistance.toDouble()
+            acc.fat         = fat
+            acc.muscle      = calc.getMuscle(fat)
+            acc.water       = calc.getWater(fat)
+            acc.bone        = calc.getBoneMass(acc.muscle, weightKg)
+            acc.lbm         = calc.getLeanBodyMass(weightKg, fat)
+            acc.visceralFat = calc.getVisceralFat(fat, user.age)
+            LogManager.i(TAG, "Body composition: fat=${acc.fat}% muscle=${acc.muscle}%")
         }
 
-        if (acc.weight > 0f) {
-            acc.userId = user.id
-            if (acc.dateTime == null) acc.dateTime = Date()
-            LogManager.i(TAG, "Publishing measurement: weight=${acc.weight} kg, fat=${acc.fat}%")
-            publish(snapshot(acc))
-        } else {
-            LogManager.w(TAG, "No valid weight decoded from $weightFrameCount frames; skip publishing.")
-        }
+        acc.userId   = user.id
+        acc.dateTime = Date()
+        publish(snapshot(acc))
 
-        rawFrames.clear()
-        resetAccumulator()
+        resetState()
     }
 
     private fun snapshot(m: ScaleMeasurement) = ScaleMeasurement().apply {
@@ -354,103 +416,24 @@ class ESCS20mHandler : ScaleDeviceHandler() {
         bone        = m.bone
         lbm         = m.lbm
         visceralFat = m.visceralFat
+        impedance   = m.impedance
     }
 
-    private fun parseFrame(frame: ByteArray, calc: YunmaiLib, user: ScaleUser) {
-        if (frame.size < 3) return
-        when ((frame[2].toInt() and 0xFF)) {
-            MSG_WEIGHT_RESP   -> parseWeightFrame(frame, calc, user)
-            MSG_EXTENDED_RESP -> parseExtendedFrame(frame, calc, user)
-        }
-    }
-
-    /**
-     * Weight frame (0x14).
-     *
-     * Protocol:
-     *   55 AA 14 00 07 00 00 00 [w_hi] [w_lo] [r_hi] [r_lo] [checksum]
-     *   bytes[8..9]  = weight, big-endian, units of 0.01 kg
-     *   bytes[10..11] = optional embedded resistance (0x0000 if weight-only mode)
-     */
-    private fun parseWeightFrame(msg: ByteArray, calc: YunmaiLib, user: ScaleUser) {
-        if (msg.size < 12) return
-
-        val weightRaw = u16be(msg, 8)
-        val weightKg = weightRaw / 100.0f
-
-        if (weightKg < 0.5f || weightKg > 300f) {
-            LogManager.d(TAG, "Ignoring unreasonable weight: $weightKg kg (raw=$weightRaw)")
-            return
-        }
-
-        acc.weight = weightKg
-
-        // Embedded resistance in this frame?
-        val hasEmbedded = (msg[10].toInt() and 0xFF) != 0 || (msg[11].toInt() and 0xFF) != 0
-        val hasSeparateExt = rawFrames.any { it.size >= 3 && ((it[2].toInt() and 0xFF) == MSG_EXTENDED_RESP) }
-
-        if (hasEmbedded && !hasSeparateExt) {
-            val resistance = u16be(msg, 10)
-            LogManager.d(TAG, "Embedded resistance in 0x14 frame: $resistance Ω")
-            applyExtended(resistance, calc, user)
-        } else if (!hasEmbedded) {
-            LogManager.d(TAG, "No resistance in 0x14 frame (bytes[10:11]=0x0000); weight-only frame")
-        }
-    }
-
-    /**
-     * Extended frame (0x15): resistance at bytes[9..10] (big-endian).
-     */
-    private fun parseExtendedFrame(msg: ByteArray, calc: YunmaiLib, user: ScaleUser) {
-        if (msg.size < 11) return
-        val resistance = u16be(msg, 9)
-        applyExtended(resistance, calc, user)
-    }
-
-    /**
-     * Compute body composition from resistance using YunmaiLib and store in accumulator.
-     */
-    private fun applyExtended(resistance: Int, calc: YunmaiLib, user: ScaleUser) {
-        val w = acc.weight
-        if (w <= 0f) {
-            LogManager.d(TAG, "Weight not yet set; skipping body-composition calculation.")
-            return
-        }
-
-        val fat = calc.getFat(user.age, w, resistance)
-        val musclePct = calc.getMuscle(fat) / w * 100.0f
-        val waterPct = calc.getWater(fat)
-        val bone = calc.getBoneMass(musclePct, w)
-        val lbm = calc.getLeanBodyMass(w, fat)
-        val visceral = calc.getVisceralFat(fat, user.age)
-
-        acc.impedance = resistance.toDouble()
-        acc.fat = fat
-        acc.muscle = musclePct
-        acc.water = waterPct
-        acc.bone = bone
-        acc.lbm = lbm
-        acc.visceralFat = visceral
-    }
-
-    // ── Helpers ──────────────────────────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     private fun u16be(b: ByteArray, off: Int): Int {
         if (off + 1 >= b.size) return 0
         return ((b[off].toInt() and 0xFF) shl 8) or (b[off + 1].toInt() and 0xFF)
     }
 
-    private fun resetAccumulator() {
-        acc.userId = -1
-        acc.dateTime = null
-        acc.weight = 0f
-        acc.fat = 0f
-        acc.muscle = 0f
-        acc.water = 0f
-        acc.bone = 0f
-        acc.lbm = 0f
-        acc.visceralFat = 0f
-        qnResistance = 0
-        qnProtocolType = 0x00
+    private fun resetState() {
+        acc.apply {
+            userId = -1; dateTime = null; weight = 0f; fat = 0f; muscle = 0f
+            water = 0f; bone = 0f; lbm = 0f; visceralFat = 0f; impedance = 0.0
+        }
+        connPhase     = PHASE_WAIT_PROFILE_ACK
+        biaResistance = 0
+        lastWeightRaw = 0
+        lefuFrag      = null
     }
 }
